@@ -16,10 +16,25 @@ total; complaint pages set has_next because the site caps its total at
 from cache import cached_call
 from better_business_bureau import cache_config as ttl
 from better_business_bureau import fetch, parsers, refs
-from better_business_bureau.fetch import BBBNotFound
+from better_business_bureau.fetch import BBBBadRequest, BBBNotFound
 
 
 # ---- search ------------------------------------------------------------------
+
+_COUNTRY_NAMES = {"USA": "the United States", "CAN": "Canada"}
+
+
+def _searched_page(params):
+    """GET a search page; a location BBB cannot place in the searched country
+    -> 400, instead of BBB's whole-index fallback (parsers.is_unplaced_search)."""
+    state, html = fetch.fetch_search(params)
+    if parsers.is_unplaced_search(state):
+        country = params["find_country"]
+        other = "ca" if country == "USA" else "us"
+        raise BBBBadRequest(
+            f"BBB cannot find the location {params.get('find_loc')!r} in {_COUNTRY_NAMES.get(country, country)}. "
+            f"Check the spelling, or set country={other} for a location in {_COUNTRY_NAMES['CAN' if other == 'ca' else 'USA']}.")
+    return state, html
 
 def _search_params(data, find_text, find_type=None, find_entity=None):
     params = {"find_text": find_text, "find_country": data.get("country") or refs.DEFAULT_COUNTRY,
@@ -53,7 +68,7 @@ def _search_params(data, find_text, find_type=None, find_entity=None):
 
 def _companies_search(**data):
     params = _search_params(data, data["query"], find_type=data.get("search_type"))
-    state, _ = fetch.fetch_search(params)
+    state, _ = _searched_page(params)
     result = parsers.parse_search(state, data.get("page") or 1)
     result["query"] = data["query"]
     result["country"] = params["find_country"]
@@ -111,7 +126,7 @@ def _categories_search(**data):
     category = resolve_category(data["category"], country)
     params = _search_params(data, category.get("name") or category["id"],
                            find_type="Category", find_entity=category["id"])
-    state, _ = fetch.fetch_search(params)
+    state, _ = _searched_page(params)
     result = parsers.parse_search(state, data.get("page") or 1)
     name = category.get("name")
     if not name:

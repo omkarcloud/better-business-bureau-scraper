@@ -7,9 +7,12 @@ Fixtures are real www.bbb.org pages and JSON captured 2026-11-07
 a filtered + sorted name search page 2, a nonsense term), a city category
 page, four profiles (Amazon: accredited multi-location with alerts and
 licences; M G Painting: not rated, licence; Sullivan Lane: hours, media,
-obfuscated email; a Canadian business), review and complaint pages (full
-and empty), the suggest JSONs, the site's 404 page and a Cloudflare
-challenge page. No network.
+an email in its description; a Canadian business), review and complaint
+pages (full and empty), the suggest JSONs, the site's 404 page and a
+Cloudflare challenge page; plus two profiles captured 2026-11-10
+(Roto-Rooter: custom-text records, related businesses, a licensing board's
+email; Ecotech Roofing: BBB-obfuscated contact emails, and a reviews page
+with the business's replies). No network.
 """
 import json
 import os
@@ -86,12 +89,32 @@ def test_strip_tags_and_html_text():
     assert P.html_text("") is None
 
 
-def test_decode_cfemail():
-    assert P.decode_cfemail("1f7a726a2d5f6a73736a69767e753b7e73706a7a71703d7c7072") != "Amon@SullivanLaneInc.com"
+def test_decode_bbb_email():
+    assert P.decode_bbb_email("!~xK_bL!robertb__at__ecotechroofing__dot__com!~xK_bL!") == "robertb@ecotechroofing.com"
+    assert P.decode_bbb_email("info@acme.com") == "info@acme.com"
+    assert P.decode_bbb_email("") is None and P.decode_bbb_email(None) is None
+    assert P.decode_bbb_email("!~xK_bL!not an email!~xK_bL!") is None
+
+
+def test_text_emails_drop_a_glued_phone_number():
+    fragment = "(312) 772-5701Amon@SullivanLaneInc.com<br>Hours<br>Email:&nbsp;Amon@SullivanLaneInc.com<br>"
+    assert P.text_emails(fragment) == ["Amon@SullivanLaneInc.com"]
+    assert P.text_emails("no address here") == [] and P.text_emails(None) == []
+
+
+def test_profile_emails_come_from_the_business_only():
+    html = fixture("profile_ecotech_bbb_email.html")
+    ecotech = P.parse_profile(P.preloaded_state(html), html)
+    assert ecotech["contact"]["email"] == "robertb@ecotechroofing.com"
+    assert all("__at__" not in e and "!~" not in e for e in ecotech["contact"]["additional_emails"])
     html = fixture("profile_sullivan_lane_email_hours.html")
-    assert P.page_emails(html) == ["Amon@SullivanLaneInc.com"]
-    assert P.page_emails(fixture("profile_amazon.html")) == []
-    assert P.page_emails(None) == []
+    assert P.parse_profile(P.preloaded_state(html), html)["contact"]["email"] == "Amon@SullivanLaneInc.com"
+    # Roto-Rooter's page carries only a licensing board's (Cloudflare-
+    # obfuscated) address in its referral text: not the business's email
+    html = fixture("profile_rotorooter_custom_texts.html")
+    assert P.parse_profile(P.preloaded_state(html), html)["contact"]["email"] is None
+    html = fixture("profile_amazon.html")
+    assert P.parse_profile(P.preloaded_state(html), html)["contact"]["email"] is None
 
 
 # ---- search -------------------------------------------------------------------
@@ -124,9 +147,22 @@ def test_parse_search_page():
     assert first["bbb_office"]["id"] == "0654"
     assert first["leave_review_link"].endswith("/leave-a-review")
     assert first["logo_link"] is None and first["distance_miles"] is None
+    roto = next(r for r in result["results"] if r["id"] == "0292-1922")
+    assert roto["service_area_description"] == "(Nationwide - See attached list of branches and locations)"
 
 
-def test_parse_search_strips_highlights_and_keeps_filters():
+def test_parse_search_card_per_address_has_its_own_page():
+    """A business with several addresses: its main card, then one card per
+    extra address with the same id, each pointing at its own address page
+    (captured 2026-11-07)."""
+    result = P.parse_search(state_of("search_name_amazon_filtered.html"), 2)
+    valley = [r for r in result["results"] if r["id"] == "1126-1000048451"]
+    assert [r["address"]["city"] for r in valley] == ["Phoenix", "Avondale", "Phoenix"]
+    assert valley[0]["local_profile_link"] is None
+    assert [r["local_profile_link"] for r in valley[1:]] == [
+        "https://www.bbb.org/us/az/avondale/profile/general-engineering-contractor/amazon-valley-engineering-1126-1000048451/addressId/416382",
+        "https://www.bbb.org/us/az/phoenix/profile/general-engineering-contractor/amazon-valley-engineering-1126-1000048451/addressId/172069",
+    ]
     result = P.parse_search(state_of("search_name_amazon_filtered.html"), 2)
     assert result["query"] == "Amazon"
     assert result["location"] is None
@@ -156,6 +192,57 @@ def test_parse_search_empty_state():
     assert result["results"] == [] and result["pagination"] == {"page": 3, "items_per_page": 15,
                                                                  "total_pages": 0, "total_count": 0}
     assert P.parse_search(None, 1)["location"] is None
+
+
+def test_license_agency_drops_the_offices_ordering_number(painting, amazon):
+    """BBB's California offices prefix agencies with an ordering number."""
+    agencies = [item["agency"]["name"] for item in painting["licenses"]["items"]]
+    assert "Contractors State Licensing Board" in agencies
+    assert not any(name[0].isdigit() for name in agencies)
+    assert amazon["licenses"]["items"][0]["agency"]["name"] == "Washington Secretary of State"
+
+
+def test_branch_profile_names_its_headquarters(amazon):
+    """Blink for Home, one of Amazon's branch profiles (captured 2026-11-10):
+    hqInformation holds the HQ's name, street, city, state, ZIP and ids."""
+    html = fixture("profile_blink_branch_hq.html")
+    branch = P.parse_profile(P.preloaded_state(html), html)
+    assert branch["id"] == "0021-139303" and branch["name"] == "Blink for Home"
+    assert branch["headquarters"] == {"id": "1296-7039385", "name": "Amazon.com",
+                                      "address": "202 Westlake Ave N Ste 2, Seattle, WA 98109-5264"}
+    assert amazon["headquarters"] is None
+    assert P._headquarters(None) is None and P._headquarters({}) is None
+
+
+def test_one_line_address_drops_a_hidden_street():
+    assert P._one_line_address(", Los Angeles, CA 90035-4331") == "Los Angeles, CA 90035-4331"
+    assert P._one_line_address("202 Westlake Ave N Ste 2, Seattle, WA 98109-5264") == \
+        "202 Westlake Ave N Ste 2, Seattle, WA 98109-5264"
+    assert P._one_line_address(" , ") is None and P._one_line_address(None) is None
+
+
+def test_unplaced_location_is_the_whole_index_fallback():
+    """plumber near Toronto, ON in the US directory (captured 2026-11-10):
+    BBB has no location for it and lists its whole index, every card named
+    SINGLEREPORTING; real pages, with or without matches, are not flagged."""
+    state = state_of("search_unplaced_location.html")
+    assert P.is_unplaced_search(state)
+    assert P.parse_search(state, 1)["pagination"]["total_count"] > 7_000_000
+    for name in ("search_plumber_chicago_p1.html", "search_no_results.html", "category_plumber_chicago.html",
+                 "search_name_amazon_filtered.html"):
+        assert not P.is_unplaced_search(state_of(name)), name
+    assert not P.is_unplaced_search({}) and not P.is_unplaced_search(None)
+
+
+def test_search_endpoints_refuse_an_unplaced_location(monkeypatch):
+    from better_business_bureau import api, fetch
+    from better_business_bureau.fetch import BBBBadRequest
+    monkeypatch.setattr(fetch, "fetch_search", lambda params: (state_of("search_unplaced_location.html"), ""))
+    with pytest.raises(BBBBadRequest, match=r"'Toronto, ON' in the United States\. .*country=ca"):
+        api._companies_search(query="plumber", location="Toronto, ON", country="USA", page=1)
+    monkeypatch.setattr(api, "resolve_category", lambda category, country: {"id": "10113-000", "name": "Plumber"})
+    with pytest.raises(BBBBadRequest, match=r"in Canada\. .*country=us"):
+        api._categories_search(category="plumber", location="Beverly Hills, CA", country="CAN", page=1)
 
 
 # ---- profile ----------------------------------------------------------------------
@@ -255,7 +342,7 @@ def test_profile_not_rated_sparse(painting):
     assert painting["entity_type"] == "Sole Proprietorship"
     assert painting["licenses"]["items"][0] == {
         "number": "796236", "expiration_date": "2027-06-30", "notes": None,
-        "agency": {"name": "2-Contractors State Licensing Board", "phone": "800-3212752", "email": None,
+        "agency": {"name": "Contractors State Licensing Board", "phone": "800-3212752", "email": None,
                    "link": "https://www.cslb.ca.gov/", "address": "100 Paseo De San Antonio #319 San Jose CA 95113"}}
     assert painting["hours"] is None and painting["description"] is None
     assert painting["reviews_summary"] == {"count": 0, "average_rating": None, "are_suppressed": False, "latest": []}
@@ -282,6 +369,30 @@ def test_profile_empty_state_never_crashes():
     assert record["contact"]["email"] is None and record["people"] == [] and record["hours"] is None
     assert record["locations"] == {"count": None, "items": []}
     assert P.parse_profile(None, "", None)["id"] is None
+
+
+def test_profile_custom_text_records_and_html_texts():
+    """Roto-Rooter (captured 2026-11-10): accreditation notes are
+    {customText, ...} records, payment methods an HTML string."""
+    html = fixture("profile_rotorooter_custom_texts.html")
+    record = P.parse_profile(P.preloaded_state(html), html)
+    assert record["id"] == "0292-1922"
+    assert record["accreditation"]["notes"][0].startswith("Roto-Rooter Plumbing & Water Cleanup at its headquarters")
+    assert record["payment_methods"] and record["payment_methods"][0].startswith("Visa, MasterCard")
+    assert all("<" not in p for p in record["payment_methods"])
+    assert "Roto Rooter Services Company" in record["alternate_names"]
+    assert record["referral_assistance"][0].startswith("Kentucky Department of Housing")
+    assert record["related_businesses"][0] == {
+        "id": "0292-3148", "name": "Chemed Corporation",
+        "link": "https://www.bbb.org/us/oh/cincinnati/profile/holding-company/chemed-corporation-0292-3148"}
+    assert record["related_businesses"][1]["name"] == "Vitas Healthcare Corporation of Ohio"
+
+
+def test_html_text_shapes():
+    assert P.html_text({"customText": "<b>Accredited</b> everywhere", "customTextSectionId": 7101}) == "Accredited everywhere"
+    assert P.html_text({"orgCustomTextId": 0}) is None
+    assert P.html_text(["x"]) is None and P.html_text(7) is None
+    assert P.html_text("Plain & simple") == "Plain & simple"
 
 
 # ---- reviews -------------------------------------------------------------------------
@@ -313,6 +424,44 @@ def test_parse_review_with_responses():
     assert review["text"] == "Great more"
     assert review["business_response"] == {"text": "Thanks a lot", "date": "2026-02-02"}
     assert review["date"] == "2026-02-01"
+    assert review["responses"] == []
+
+
+def test_parse_reviews_reads_the_reply_thread():
+    """Ecotech Roofing (captured 2026-11-10): the business's replies sit in
+    extendedText as {text, date, isBusiness, ...} messages."""
+    result = P.parse_reviews(state_of("reviews_ecotech_business_replies.html"), 1)
+    replied = [r for r in result["reviews"] if r["business_response"]]
+    assert replied, "no business reply parsed"
+    first = replied[0]
+    assert first["business_response"]["text"] and first["business_response"]["date"]
+    assert first["responses"][0]["from"] == "business"
+    assert first["responses"][0]["text"] == first["business_response"]["text"]
+    assert all(isinstance(r["text"], str) and "{" not in r["text"] for r in result["reviews"] if r["text"])
+
+
+def test_review_thread_senders():
+    review = P.parse_review({"id": "y", "text": "Bad", "extendedText": [
+        {"text": "Sorry, we fixed it", "date": {"day": "02", "month": "01", "year": "2026"}, "isBusiness": True},
+        {"text": "Still broken", "date": {"day": "03", "month": "01", "year": "2026"}, "isCustomer": True},
+        {"text": "Replaced it free", "date": {"day": "04", "month": "01", "year": "2026"}, "isBusiness": True},
+    ]})
+    assert review["text"] == "Bad"
+    assert review["business_response"] == {"text": "Sorry, we fixed it", "date": "2026-01-02"}
+    assert review["customer_response"] == {"text": "Still broken", "date": "2026-01-03"}
+    assert review["business_rebuttal"] == {"text": "Replaced it free", "date": "2026-01-04"}
+    assert [m["from"] for m in review["responses"]] == ["business", "customer", "business"]
+
+
+def test_review_reply_posted_twice_is_not_a_rebuttal():
+    """Sunrun (2026-11-10) posted the same reply twice, before any customer
+    response: still one business response and no rebuttal."""
+    reply = {"text": "We apologize sincerely", "date": {"day": "27", "month": "01", "year": "2026"}, "isBusiness": True}
+    review = P.parse_review({"id": "z", "text": "Bad", "extendedText": [reply, dict(reply)]})
+    assert review["business_response"] == {"text": "We apologize sincerely", "date": "2026-01-27"}
+    assert review["customer_response"] is None
+    assert review["business_rebuttal"] is None
+    assert len(review["responses"]) == 2
 
 
 # ---- complaints ----------------------------------------------------------------------

@@ -5,11 +5,14 @@ Every bbb.org page embeds its data as one JSON object in
 category pages carry `searchResult`, a business profile `businessProfile`,
 its /customer-reviews tab adds `businessProfile.customerReviews` and its
 /complaints tab `businessProfile.customerComplaints`. Nothing here parses
-rendered HTML except two things the state leaves out: the business email
-(Cloudflare-obfuscated `data-cfemail` attribute, decode_cfemail) and the
-page <title> (fetch.py uses it to tell a not-found page from a block). The
-two typeahead calls (/api/suggest/find, /api/suggest/location) are plain
-JSON lists.
+rendered HTML except the page <title> (fetch.py uses it to tell a
+not-found page from a block). Business emails come from the state: BBB's
+own obfuscation of the contact emails (decode_bbb_email) and addresses the
+business wrote into its own description (text_emails). The rendered page's
+Cloudflare-obfuscated emails are never read: they include other parties'
+addresses, such as a licensing board in the referral text. The two
+typeahead calls (/api/suggest/find, /api/suggest/location) are plain JSON
+lists.
 
 Value conventions (shared with the other scraper packages):
   * keys     snake_case; `link` not `url`; booleans as questions
@@ -31,9 +34,13 @@ rated, licence, no reviews; Sullivan Lane: hours, logo + image carousel,
 obfuscated email, referral text), a Canadian profile, review pages
 (Amazon page 2, an empty one), complaint pages (Amazon delivery + resolved
 filter page 2, an empty one), the suggest JSONs, the site's 404 page and
-a Cloudflare challenge page. Their inline <style> blocks were removed on
-2026-11-10: nothing here reads CSS, and the site's login-form class names
-tripped the secret grep the published open-source copy must pass.
+a Cloudflare challenge page. Added 2026-11-10: Roto-Rooter (custom-text
+records, HTML payment texts, related businesses, a licensing board's email
+in its referral text) and Ecotech Roofing (BBB-obfuscated contact emails;
+its reviews page carries the business's replies in extendedText).
+Their inline <style> blocks were removed on 2026-11-10: nothing here reads
+CSS, and the site's login-form class names tripped the secret grep the
+published open-source copy must pass.
 """
 import fastjson
 import math
@@ -52,9 +59,10 @@ COMPLAINTS_MAX_PAGE = 1000   # the site answers pages up to 1000, -1 results pas
 _STATE_RE = re.compile(r"window\.__PRELOADED_STATE__\s*=\s*", re.S)
 _TITLE_RE = re.compile(r"<title>([^<]*)</title>", re.I)
 _TAG_RE = re.compile(r"<[^>]+>")
-_CFEMAIL_RE = re.compile(r'data-cfemail="([0-9a-fA-F]+)"')
-_MAILTO_RE = re.compile(r'href="mailto:([^"?]+)')
+_BBB_EMAIL_MARK_RE = re.compile(r"!~[^!\s]{1,16}!")
+_PROFILE_ID_RE = re.compile(r"/profile/[^/?#]+/[^/?#]*?(\d{4})-(\d{1,12})(?:[/?#]|$)")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_EMAIL_FIND_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 _DAYS = {"m": "monday", "t": "tuesday", "w": "wednesday", "th": "thursday",
          "f": "friday", "sa": "saturday", "su": "sunday"}
@@ -102,6 +110,29 @@ def clean(value):
     return value
 
 
+def _headquarters(hq):
+    """orgDetails.hqInformation of a branch profile (Blink for Home,
+    2026-11-10): {businessName, address (street only), city, state, zipCode,
+    bbbId, businessId} — no link, so the HQ's business id stands in for it."""
+    if not isinstance(hq, dict) or not hq:
+        return None
+    region = " ".join(p for p in (clean(hq.get("state")), clean(hq.get("zipCode"))) if p)
+    return {
+        "id": company_id(hq.get("bbbId"), hq.get("businessId")),
+        "name": clean(hq.get("businessName") or hq.get("name")),
+        "address": _one_line_address(", ".join(p for p in (clean(hq.get("address")), clean(hq.get("city")), region) if p)),
+    }
+
+
+def _one_line_address(value):
+    """BBB's one-line address without the empty parts a hidden street leaves
+    (", Los Angeles, CA 90035-4331", Ecorise 2026-11-10)."""
+    text = clean(value)
+    if not isinstance(text, str):
+        return text
+    return ", ".join(part for part in (p.strip() for p in text.split(",")) if part) or None
+
+
 def strip_tags(value):
     """"<em>Amazon</em> Painting" -> "Amazon Painting"; HTML entities decoded."""
     if value is None:
@@ -113,10 +144,22 @@ def strip_tags(value):
 
 
 def html_text(value):
-    """An HTML fragment -> plain text with line breaks collapsed to spaces."""
-    if not value:
+    """An HTML fragment -> plain text with line breaks collapsed to spaces.
+    BBB's custom-text records ({customText, customTextSectionId, ...}, seen
+    in accreditationInformation.text on Roto-Rooter, 2026-11-10) are read
+    from their text field; anything else that is not a string -> None."""
+    if isinstance(value, dict):
+        value = value.get("customText") or value.get("text") or value.get("html") or value.get("title")
+    if not value or not isinstance(value, str):
         return None
+    if "<" not in value and "&" not in value:
+        return clean(value)
     return clean(BeautifulSoup(value, "lxml").get_text(" ", strip=True))
+
+
+def _plain_texts(items):
+    """A list of strings or custom-text records -> the plain texts, empties dropped."""
+    return [t for t in (html_text(i) for i in (items or [])) if t]
 
 
 def iso_date(value):
@@ -163,32 +206,33 @@ def positive(value):
     return value if value else None
 
 
-def decode_cfemail(encoded):
-    """Cloudflare email obfuscation: hex string whose first byte XORs the rest."""
-    try:
-        key = int(encoded[:2], 16)
-        return "".join(chr(int(encoded[i:i + 2], 16) ^ key) for i in range(2, len(encoded), 2))
-    except (ValueError, IndexError):
+def decode_bbb_email(value):
+    """BBB's own email obfuscation in contactInformation.emailAddress and
+    additionalEmailAddresses[].value: "!~xK_bL!info__at__acme__dot__com!~xK_bL!"
+    -> "info@acme.com" (34 accredited profiles, 2026-11-10: always that marker
+    and those two tokens). A plain address passes through; anything that is
+    not an email after decoding -> None."""
+    if not isinstance(value, str):
         return None
+    decoded = _BBB_EMAIL_MARK_RE.sub("", value).replace("__at__", "@").replace("__dot__", ".")
+    decoded = clean(decoded)
+    return decoded if decoded and _EMAIL_RE.match(decoded) else None
 
 
-def page_emails(html):
-    """Every email the rendered profile shows (data-cfemail + mailto:),
-    deduped in page order; the state's own emailAddress is empty even when
-    the page shows one (2026-11-07)."""
-    seen, out = set(), []
-    for encoded in _CFEMAIL_RE.findall(html or ""):
-        email = decode_cfemail(encoded)
-        if email and _EMAIL_RE.match(email) and email.lower() not in seen:
-            seen.add(email.lower())
+def text_emails(fragment):
+    """Emails a business wrote into its own HTML text (description, products
+    and services), in order, deduped. The page renders them Cloudflare-
+    obfuscated but the state keeps them plain. A phone number glued to an
+    address ("(312) 772-5701Amon@x.com") is dropped when the same text also
+    carries the bare address."""
+    if not isinstance(fragment, str) or "@" not in fragment:
+        return []
+    text = BeautifulSoup(fragment, "lxml").get_text(" ")
+    out = []
+    for email in _EMAIL_FIND_RE.findall(text):
+        email = email.rstrip(".")
+        if email.lower() not in (e.lower() for e in out):
             out.append(email)
-    for email in _MAILTO_RE.findall(html or ""):
-        if _EMAIL_RE.match(email) and email.lower() not in seen:
-            seen.add(email.lower())
-            out.append(email)
-    # Cloudflare also obfuscates an email glued to the text before it inside
-    # a free-text description ("(312) 772-5701Amon@x.com"): drop a candidate
-    # that merely ends with another, shorter candidate.
     lowered = [e.lower() for e in out]
     return [e for e in out if not any(o != e.lower() and e.lower().endswith(o) for o in lowered)]
 
@@ -229,6 +273,9 @@ def parse_search_result(item):
         "id": ident,
         "name": strip_tags(item.get("businessName")),
         "link": _link(item.get("reportUrl")),
+        # a business with several addresses gets one card per address; this
+        # is the BBB page of the card's own address (…/addressId/<n>)
+        "local_profile_link": _link(item.get("localReportUrl")),
         "rating": clean(item.get("rating")) or None,
         "rating_score": number(item.get("ratingScore")),
         "is_accredited": bool(item.get("bbbMember")),
@@ -251,7 +298,8 @@ def parse_search_result(item):
         "location": {"latitude": latitude, "longitude": longitude},
         "distance_miles": number(item.get("distance")),
         "has_service_area": bool(item.get("hasServiceArea")),
-        "service_area_description": clean(item.get("serviceAreaDescription")),
+        # cards fill serviceArea (HTML, 21 of 90 cards 2026-11-10); serviceAreaDescription stays null
+        "service_area_description": html_text(item.get("serviceArea")) or clean(item.get("serviceAreaDescription")),
         "service_areas": [clean(a) for a in (item.get("serviceAreasSummary") or []) if clean(a)],
         "accepts_quote_requests": bool(item.get("raqEnabled")) and bool(item.get("requestAQuoteUrl")),
         "request_quote_link": _link(item.get("requestAQuoteUrl")),
@@ -292,6 +340,22 @@ def _filter_options(filters, key):
 def _titled_links(items):
     return [{"name": clean(i.get("title")), "link": _link(i.get("url"))}
             for i in (items or []) if isinstance(i, dict) and i.get("title")]
+
+
+# The name BBB puts on every card of its whole-index fallback.
+UNPLACED_CARD_NAME = "SINGLEREPORTING"
+
+
+def is_unplaced_search(state):
+    """True when BBB could not place the searched location in the searched
+    country (Toronto, ON in the US directory, a made-up city): the page then
+    has no location block and lists BBB's whole index instead of matches —
+    7.5M "results", unrelated to the query, every card named SINGLEREPORTING
+    (2026-11-10). Real searches never carry that name."""
+    sr = (state or {}).get("searchResult") or {}
+    results = [r for r in (sr.get("results") or []) if isinstance(r, dict)]
+    return (not sr.get("location") and bool(results)
+            and all(clean(r.get("businessName")) == UNPLACED_CARD_NAME for r in results))
 
 
 def parse_search(state, page):
@@ -396,6 +460,9 @@ def _hours(block):
     return out or None
 
 
+_AGENCY_ORDER_RE = re.compile(r"^\d{1,2}-(?=[A-Za-z])")
+
+
 def _licenses(block):
     if not isinstance(block, dict):
         return {"is_license_required": None, "items": [], "notes": []}
@@ -409,7 +476,8 @@ def _licenses(block):
             "expiration_date": iso_date(d.get("expirationDate")),
             "notes": clean(d.get("notes")),
             "agency": {
-                "name": clean(agency.get("name")),
+                # California offices number their agencies: "2-Contractors State Licensing Board"
+                "name": _AGENCY_ORDER_RE.sub("", clean(agency.get("name")) or "") or None,
                 "phone": clean(agency.get("phoneNumber")),
                 "email": clean(agency.get("email")),
                 "link": clean(agency.get("url")),
@@ -419,7 +487,7 @@ def _licenses(block):
     return {
         "is_license_required": bool(block.get("isCompetencyLicenseRequired")),
         "items": items,
-        "notes": [html_text(t) for t in (block.get("licensingTexts") or []) if html_text(t)],
+        "notes": _plain_texts(block.get("licensingTexts")),
     }
 
 
@@ -552,10 +620,45 @@ def _faq(block):
             for f in _by_id_list(block) if isinstance(f, dict) and f.get("question")]
 
 
+def _related_business(item):
+    """display.relatedBusinessList.relatedBusinesses[]: {key: <name>, value:
+    <profile link>} (Roto-Rooter -> Chemed Corporation, 2026-11-10)."""
+    if not isinstance(item, dict):
+        return None
+    name = clean(item.get("key") or item.get("name"))
+    link = _link(clean(item.get("value") or item.get("url")))
+    if not (name or link):
+        return None
+    match = _PROFILE_ID_RE.search(link or "")
+    return {"id": company_id(match.group(1), match.group(2)) if match else None, "name": name, "link": link}
+
+
+def _business_emails(contact, org, display):
+    """The business's own emails: BBB's obfuscated contact emails first
+    (decode_bbb_email), then addresses the business wrote into its
+    description or products text. The rendered page also Cloudflare-
+    obfuscates OTHER parties' emails (a licensing board in the referral
+    text, Roto-Rooter 2026-11-10), so the page itself is never scanned."""
+    out = []
+
+    def add(email):
+        if email and email.lower() not in (e.lower() for e in out):
+            out.append(email)
+
+    add(decode_bbb_email(contact.get("emailAddress")))
+    for item in contact.get("additionalEmailAddresses") or []:
+        add(decode_bbb_email(item.get("value") if isinstance(item, dict) else item))
+    for fragment in (org.get("organizationDescription"), display.get("prodSrvcsSummary")):
+        for email in text_emails(fragment):
+            add(email)
+    return out
+
+
 def parse_profile(state, html=None, ident=None):
-    """A profile page state (+ its HTML for the obfuscated email) -> the
-    full company record. Every tab of the profile carries the same
-    businessProfile block, so any tab's state parses here."""
+    """A profile page state -> the full company record. Every tab of the
+    profile carries the same businessProfile block, so any tab's state
+    parses here. `html` is accepted for callers that pass the page along;
+    nothing is read from it."""
     bp = (state or {}).get("businessProfile") or {}
     names = bp.get("names") or {}
     rating = bp.get("rating") or {}
@@ -572,14 +675,7 @@ def parse_profile(state, html=None, ident=None):
     entity = org.get("typeOfEntity") or {}
     claim = display.get("claim") or {}
     texts = _texts(display.get("additionalInformationTexts"))
-    emails = page_emails(html) if html else []
-    state_email = clean(contact.get("emailAddress"))
-    if state_email and state_email not in emails:
-        emails.insert(0, state_email)
-    extra_emails = [e["value"] for e in _labelled(contact.get("additionalEmailAddresses"))]
-    for e in extra_emails:
-        if e not in emails:
-            emails.append(e)
+    emails = _business_emails(contact, org, display)
     ident = ident or company_id(bp.get("bbbId"), bp.get("businessId"))
     profile_path = urls.get("profile")
     hq = org.get("hqInformation") or {}
@@ -591,19 +687,19 @@ def parse_profile(state, html=None, ident=None):
         "bbb_id": clean(bp.get("bbbId")),
         "business_id": clean(bp.get("businessId")),
         "name": clean(names.get("primary")),
-        "alternate_names": [clean(n) for n in (names.get("altBusinessNames") or []) if clean(n)],
+        "alternate_names": _plain_texts(names.get("altBusinessNames")),
         "link": _link(profile_path),
         "rating": {
             "grade": clean(rating.get("bbbRating")),
             "is_rated": clean(rating.get("bbbRating")) not in (None, "NR"),
             "not_rated_reason": clean(rating.get("ratingReasonNotRated")),
-            "reasons": [html_text(r) for r in (rating.get("ratingReasons") or []) if html_text(r)],
+            "reasons": _plain_texts(rating.get("ratingReasons")),
         },
         "accreditation": {
             "is_accredited": bool(accreditation.get("isAccredited")),
             "since": iso_date(dates.get("accredited")),
             "revoked_date": iso_date(dates.get("accreditationRevoked")),
-            "notes": [html_text(t) for t in (accreditation.get("text") or []) if html_text(t)],
+            "notes": _plain_texts(accreditation.get("text")),
         },
         "is_out_of_business": bool(org.get("isOutOfBusiness")),
         "is_claimed": bool(claim.get("isClaimed")),
@@ -620,8 +716,8 @@ def parse_profile(state, html=None, ident=None):
         "entity_type": clean(entity.get("name")) if entity.get("canDisplay", True) else None,
         "years_in_business": positive(org.get("yearsInBusiness")),
         "number_of_employees": positive(org.get("numEmployees")),
-        "payment_methods": [clean(p) for p in (org.get("paymentMethods") or []) if clean(p)]
-                           + [clean(p) for p in (org.get("paymentMethodCustomTexts") or []) if clean(p)],
+        # paymentMethodCustomTexts are HTML ("<br>Visa, MasterCard, ...")
+        "payment_methods": _plain_texts(org.get("paymentMethods")) + _plain_texts(org.get("paymentMethodCustomTexts")),
         "dates": {
             "business_started": iso_date(dates.get("businessStart")),
             "local_business_started": iso_date(dates.get("businessLocalStart")),
@@ -646,7 +742,7 @@ def parse_profile(state, html=None, ident=None):
         "people": _contacts(contact.get("contacts")),
         "address": _address(location.get("postalAddress") or location.get("displayAddress")),
         "location": {
-            "formatted_address": clean(location.get("formattedAddress")),
+            "formatted_address": _one_line_address(location.get("formattedAddress")),
             "latitude": number(location.get("latitude")),
             "longitude": number(location.get("longitude")),
             "is_us_based": bool(location.get("isUsBased")),
@@ -654,16 +750,12 @@ def parse_profile(state, html=None, ident=None):
             "serving_areas": _serving_areas(location.get("servingAreas")),
         },
         "hours": _hours(location.get("operatingHours")),
-        "headquarters": {
-            "name": clean(hq.get("name") or hq.get("businessName")),
-            "link": _link(hq.get("url") or hq.get("reportUrl")),
-            "address": clean(hq.get("address") or hq.get("formattedAddress")),
-        } if hq else None,
+        "headquarters": _headquarters(hq),
         "licenses": _licenses(org.get("license")),
         "social_media": _social(display.get("socialMediaList")),
         "alerts": _alerts(display.get("alerts")),
         "additional_information": texts,
-        "referral_assistance": [html_text(t) for t in (display.get("referralAssistanceTexts") or []) if html_text(t)],
+        "referral_assistance": _plain_texts(display.get("referralAssistanceTexts")),
         "program_participation": html_text(display.get("programParticipationText")),
         "reviews_summary": {
             "count": number(summary.get("reviewsTotal")) or 0,
@@ -678,10 +770,8 @@ def parse_profile(state, html=None, ident=None):
             "closed_last_12_months": number(summary.get("totalClosedComplaintsPastTwelveMonths")) or 0,
         },
         "locations": _locations(bp.get("dialogLocations")),
-        "related_businesses": [
-            {"name": clean(b.get("name") or b.get("businessName")), "link": _link(b.get("url") or b.get("reportUrl")),
-             "relationship": clean(b.get("relationship") or b.get("type"))}
-            for b in ((display.get("relatedBusinessList") or {}).get("relatedBusinesses") or []) if isinstance(b, dict)],
+        "related_businesses": [r for r in (_related_business(b) for b in (
+            (display.get("relatedBusinessList") or {}).get("relatedBusinesses") or [])) if r],
         "media": _media(bp.get("media")),
         "bbb_office": {"name": clean(local.get("name")), "link": _link(local.get("url"))} if local.get("name") else None,
         "faq": _faq(bp.get("faq")),
@@ -704,17 +794,55 @@ def _dated_text(text, date):
     return {"text": text, "date": date} if (text or date) else None
 
 
+def _review_thread(extended):
+    """A review's replies: extendedText is a list of messages {id, title, text,
+    date, isBusiness, isCustomer, isBureau} (2026-11-10: the business's reply
+    lives here, businessResponseText stays null) -> [{from, date, text}] in
+    order, `from` = business | customer | bbb."""
+    thread = []
+    for message in extended or []:
+        if not isinstance(message, dict):
+            continue
+        sender = ("business" if message.get("isBusiness") else "customer" if message.get("isCustomer")
+                  else "bbb" if message.get("isBureau") else None)
+        text = html_text(message.get("text"))
+        if text or sender:
+            thread.append({"from": sender, "date": iso_date(message.get("date")), "text": text})
+    return thread
+
+
+def _first_reply(thread, sender, after=None):
+    """The first `sender` message, or with `after`, the first one that comes
+    after the first `after` message: a rebuttal answers the customer's
+    response, so a business that posts the same reply twice (Sunrun,
+    2026-11-10) has no rebuttal."""
+    waiting = after is not None
+    for m in thread:
+        if waiting:
+            waiting = m["from"] != after
+        elif m["from"] == sender:
+            return {"text": m["text"], "date": m["date"]}
+    return None
+
+
 def parse_review(item):
+    extended = item.get("extendedText") or []
+    # Older pages put plain continuation strings in extendedText.
+    more_text = [t for t in extended if isinstance(t, str)]
+    thread = _review_thread(extended)
     return {
         "id": clean(item.get("id")),
         "author": clean(item.get("displayName")),
         "rating": number(item.get("reviewStarRating")),
         "date": iso_date(item.get("date")),
-        "text": html_text(item.get("text")) if not item.get("extendedText") else
-                html_text(" ".join([item.get("text") or ""] + [t for t in item.get("extendedText") if isinstance(t, str)])),
-        "business_response": _dated_text(item.get("businessResponseText"), item.get("businessResponseDate")),
-        "customer_response": _dated_text(item.get("customerResponseText"), item.get("customerResponseDate")),
-        "business_rebuttal": _dated_text(item.get("businessRebuttalText"), item.get("businessRebuttalDate")),
+        "text": html_text(" ".join([item.get("text") or ""] + more_text)) if more_text else html_text(item.get("text")),
+        "business_response": (_first_reply(thread, "business")
+                              or _dated_text(item.get("businessResponseText"), item.get("businessResponseDate"))),
+        "customer_response": (_first_reply(thread, "customer")
+                              or _dated_text(item.get("customerResponseText"), item.get("customerResponseDate"))),
+        "business_rebuttal": (_first_reply(thread, "business", after="customer")
+                              or _dated_text(item.get("businessRebuttalText"), item.get("businessRebuttalDate"))),
+        "responses": thread,
     }
 
 
